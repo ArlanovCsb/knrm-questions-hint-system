@@ -24,4 +24,6 @@ RUN python -m pip install langdetect==1.0.8
 
 COPY additional_data/ /additional_data/
 WORKDIR /workspace
+COPY . /workspace
+
 RUN chmod -R a+w /workspace

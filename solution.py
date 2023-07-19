@@ -1,5 +1,5 @@
 from argparse import ArgumentParser
-from collections import Counter
+from collections import Counter, OrderedDict
 import logging
 import os
 import string
@@ -22,19 +22,15 @@ LOG_LEVEL = 'DEBUG'
 logger.setLevel(LOG_LEVEL)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
-parser = ArgumentParser(description='Get the port')
-parser.add_argument('--port', type=str, required=False, default=5000,
-                    help='Prediction REST server port')
-args = parser.parse_args()
-PORT = args.port
-
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 
-EMB_PATH_KNRM = os.getenv('EMB_PATH_KNRM')
-VOCAB_PATH = os.getenv('VOCAB_PATH')
-MLP_PATH = os.getenv('MLP_PATH')
-EMB_PATH_GLOVE = os.getenv('EMB_PATH_GLOVE')
+parser = ArgumentParser(description='Get the port')
+parser.add_argument('--port', type=str, required=False, default=5000,
+                    help='Prediction REST server port')
+args, _ = parser.parse_known_args()
+PORT = args.port
+HOST = '0.0.0.0'
 
 
 class GaussianKernel(torch.nn.Module):
@@ -50,7 +46,7 @@ class GaussianKernel(torch.nn.Module):
 
 
 class KNRM(torch.nn.Module):
-    def __init__(self, embedding_matrix: np.ndarray, freeze_embeddings: bool, kernel_num: int = 21,
+    def __init__(self, embedding_matrix: torch.Tensor, freeze_embeddings: bool, kernel_num: int = 21,
                  sigma: float = 0.1, exact_sigma: float = 0.001,
                  out_layers: List[int] = [10, 5]):
         super().__init__()
@@ -140,17 +136,78 @@ class KNRM(torch.nn.Module):
         return out
 
 
-def init_models():
-    time.sleep(60)
+class Solution:
+    def __init__(self,
+                 freeze_knrm_embeddings: bool = True,
+                 knrm_kernel_num: int = 21,
+                 knrm_out_mlp: List[int] = [],
+                 ):
+        logger.info("Initialize Solution starting...")
+        self.knrm_emb_matrix_path = os.getenv('EMB_PATH_KNRM')
+        self.vocab_path = os.getenv('VOCAB_PATH')
+        self.mlp_path = os.getenv('MLP_PATH')
+        self.glove_vectors_path = os.getenv('EMB_PATH_GLOVE')
+        self.freeze_knrm_embeddings = freeze_knrm_embeddings
+        self.knrm_kernel_num = knrm_kernel_num
+        self.knrm_out_mlp = knrm_out_mlp
+        self._load_mlp_model()
+        self._load_vocab()
+        self._load_glove_vectors()
+        self.faiss_index = None
+        logger.info("Initialized Solution")
+
+    def _load_mlp_model(self):
+        emb_matrix = torch.load(self.knrm_emb_matrix_path)['weight']
+        self.emb_dimention = emb_matrix.shape[1]
+        self.mlp = KNRM(emb_matrix, self.freeze_knrm_embeddings, self.knrm_kernel_num, out_layers=[])
+        mlp_state = torch.load(self.mlp_path)
+        logger.debug(f'Embeding dimention is {self.emb_dimention}')
+        new_state_dict = OrderedDict()
+        new_state_dict['embeddings.weight'] = emb_matrix
+        new_state_dict['mlp.0.0.weight'] = mlp_state['0.0.weight']
+        new_state_dict['mlp.0.0.bias'] = mlp_state['0.0.bias']
+        self.mlp.load_state_dict(new_state_dict)
+        logger.info("Loaded MLP object")
+        logger.debug(self.mlp.eval())
+
+    def _load_vocab(self):
+        with open(self.vocab_path, 'r', encoding='utf-8') as f:
+            self.vocab = json.load(f)
+        logger.info("Loaded vocab")
+
+    def _load_glove_vectors(self):
+        self.embedding_data = {}
+        with open(self.glove_vectors_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                current_line = line.rstrip().split(' ')
+                self.embedding_data[current_line[0]] = current_line[1:]
+        logger.info("Loaded GLOVE dict")
+
+    @staticmethod
+    def handle_punctuation(inp_str: str) -> str:
+        inp_str = str(inp_str)
+        for punct in string.punctuation:
+            inp_str = inp_str.replace(punct, ' ')
+        return inp_str
+
+    def simple_preproc(self, inp_str: str):
+        base_str = inp_str.strip().lower()
+        str_wo_punct = self.handle_punctuation(base_str)
+        return nltk.word_tokenize(str_wo_punct)
+
+
+model = Solution()
 
 
 @app.route('/ping')
 def ping():
-    return {'status': 'ok'}
+    return json.dumps({'status': 'ok'})
 
 
 @app.route('/query', methods=['POST'])
 def query():
+    if model.faiss_index is None or not model.faiss_index.is_trained:
+        return json.dumps({'status': 'FAISS is not initialized!'})
     data = request.get_json()
 
 
@@ -160,5 +217,4 @@ def update_index():
 
 
 if __name__ == '__main__':
-    init_models()
-    app.run(port=PORT)
+    app.run(host=HOST, port=PORT)

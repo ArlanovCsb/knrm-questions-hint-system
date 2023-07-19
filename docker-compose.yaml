@@ -12,4 +12,4 @@ services:
     env_file:
           - .env
     restart: on-failure
-    command: solution.py flask run --port 11000
+    command: python -u solution.py flask run --port 11000
