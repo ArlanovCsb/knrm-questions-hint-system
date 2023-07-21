@@ -1,24 +1,22 @@
 from argparse import ArgumentParser
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 import logging
 import os
 import string
 import sys
-import time
 
-from typing import Dict, List, Tuple, Union, Callable
+from typing import Dict, List, Tuple, Optional
 
-from flask import Flask, json, request, Response
+import faiss
+from flask import Flask, json, request, Response, jsonify
 from langdetect import detect
 import nltk
 import numpy as np
-import math
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-LOG_LEVEL = 'DEBUG'
+LOG_LEVEL = 'INFO'
 logger.setLevel(LOG_LEVEL)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
@@ -141,6 +139,10 @@ class Solution:
                  freeze_knrm_embeddings: bool = True,
                  knrm_kernel_num: int = 21,
                  knrm_out_mlp: List[int] = [],
+                 index_factory_string='IVF2048_HNSW32,Flat',
+                 faiss_vector_max_len=30,
+                 k_ann_num=50,
+                 prediction_num=10
                  ):
         logger.info("Initialize Solution starting...")
         self.knrm_emb_matrix_path = os.getenv('EMB_PATH_KNRM')
@@ -153,7 +155,12 @@ class Solution:
         self._load_mlp_model()
         self._load_vocab()
         self._load_glove_vectors()
+        self.index_factory_string = index_factory_string
+        self.words_text_max_len = faiss_vector_max_len
+        self.k_ann_num = k_ann_num
+        self.prediction_num = prediction_num
         self.faiss_index = None
+        self.docs_database = None
         logger.info("Initialized Solution")
 
     def _load_mlp_model(self):
@@ -195,25 +202,119 @@ class Solution:
         str_wo_punct = self.handle_punctuation(base_str)
         return nltk.word_tokenize(str_wo_punct)
 
+    def _preproc_one_document(self, doc):
+        p_q = self.simple_preproc(doc)
+        word_emb = [self.embedding_data.get(w) for w in p_q[:self.words_text_max_len]
+                    if self.embedding_data.get(w) is not None]
+        return word_emb
+
+    def _preproc_docs_for_faiss(self) -> Tuple[np.array, np.array]:
+        idxs = []
+        docs_vectors = []
+        for i in self.docs_database.keys():
+            d = self.docs_database[i]
+            word_emb = self._preproc_one_document(d)
+            if len(word_emb) > 0:
+                word_emb = np.array(word_emb, dtype=np.float32)
+                word_emb = word_emb.mean(axis=0, dtype=np.float32)
+            else:
+                word_emb = np.zeros(self.emb_dimention, dtype=np.float32)
+            idxs.append(int(i))
+            docs_vectors.append(word_emb)
+        logger.info(f"Documents db was prepared. Len is {len(idxs)}")
+        return np.array(idxs), np.array(docs_vectors)
+
+    def _tokenized_text_to_index(self, tokenized_text: List[str]) -> List[int]:
+        res = [self.vocab.get(i, self.vocab['OOV']) for i in tokenized_text[:self.words_text_max_len]]
+        return res
+
+    def _convert_text_to_token_idxs(self, text: str) -> List[int]:
+        tokenized_text = self.simple_preproc(text)
+        idxs = self._tokenized_text_to_index(tokenized_text)
+        return idxs
+
+    def _preproc_data_for_knrm(self, query: str, doc: int) -> Dict[str, torch.LongTensor]:
+        query = torch.LongTensor(self._convert_text_to_token_idxs(query))
+        result = {'query': query.reshape(1, -1),
+                  'document':
+                      torch.LongTensor(self._convert_text_to_token_idxs(self.docs_database[str(doc)])).reshape(1, -1)}
+        return result
+
+    def train_faiss_model(self, raw_docs: Dict[str, str]) -> int:
+        self.docs_database = raw_docs
+        idxs, docs_vectors = self._preproc_docs_for_faiss()
+        index = faiss.index_factory(self.emb_dimention, self.index_factory_string)
+        logger.debug('Index train is started...')
+        index.train(docs_vectors)
+        index.add_with_ids(docs_vectors, idxs)
+        logger.debug('Index train has done')
+        self.faiss_index = index
+        return index.ntotal
+
+    def predict(self, queries: List) -> Tuple[List[bool], List[Optional[List[Tuple[str, str]]]]]:
+        lang_check = []
+        suggestions = []
+        for i in range(len(queries)):
+            lc = False
+            sug = None
+            if detect(queries[i]) == 'en':
+                word_emb = self._preproc_one_document(queries[i])
+                if len(word_emb) > 0:
+                    word_emb = np.array(word_emb, dtype=np.float32)
+                    word_emb = word_emb.mean(axis=0, dtype=np.float32).reshape(1, -1)
+                    _, k_neinborns = self.faiss_index.search(word_emb, self.k_ann_num)
+                    k_neinborns = k_neinborns.squeeze()
+                    logger.debug(k_neinborns)
+                    preds = [self.mlp.predict(self._preproc_data_for_knrm(queries[i], d)).squeeze().item()
+                             for d in k_neinborns if d >= 0]
+                    if len(preds) > 0:
+                        preds = np.array(preds)
+                        logger.debug(f'Query is {queries[i]}')
+                        logger.debug(preds)
+                        argsort = np.argsort(preds)[::-1]
+                        argsort = argsort[:self.prediction_num]
+                        pred_idxs = k_neinborns[argsort]
+                        pred = [(str(i), self.docs_database[str(i)]) for i in pred_idxs]
+                        logger.debug(f'Preds is {pred}')
+                        sug = pred
+                        lc = True
+            lang_check.append(lc)
+            suggestions.append(sug)
+        return lang_check, suggestions
+
 
 model = Solution()
 
 
 @app.route('/ping')
 def ping():
-    return json.dumps({'status': 'ok'})
+    # return jsonify({'status': 'ok'})
+    response = json.dumps({'status': 'ok'})
+    return Response(response=response, status=200, mimetype="application/json")
 
 
 @app.route('/query', methods=['POST'])
 def query():
     if model.faiss_index is None or not model.faiss_index.is_trained:
-        return json.dumps({'status': 'FAISS is not initialized!'})
-    data = request.get_json()
+        # return jsonify({'status': 'FAISS is not initialized!'})
+        response = json.dumps({'status': 'FAISS is not initialized!'})
+    else:
+        # queries = request.get_json()['queries']
+        queries = json.loads(request.json)['queries']
+        lang_check, suggestions = model.predict(queries)
+        # return jsonify({'lang_check': lang_check, 'suggestions': suggestions})
+        response = json.dumps({'lang_check': lang_check, 'suggestions': suggestions}).encode('utf-8')
+    return Response(response=response, status=200, mimetype="application/json")
 
 
 @app.route('/update_index', methods=['POST'])
 def update_index():
-    data = request.get_json()
+    # documents = request.get_json()['documents']
+    documents = json.loads(request.json)['documents']
+    index_size = model.train_faiss_model(documents)
+    # return jsonify({'status': 'ok', 'index_size': index_size})
+    response = json.dumps({'status': 'ok', 'index_size': index_size})
+    return Response(response=response, status=200, mimetype="application/json")
 
 
 if __name__ == '__main__':
