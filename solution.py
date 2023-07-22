@@ -89,15 +89,6 @@ class KNRM(torch.nn.Module):
         mlp[-1] = mlp[-1][:-1]
         return torch.nn.Sequential(*mlp)
 
-    def forward(self, input_1: Dict[str, torch.Tensor], input_2: Dict[str, torch.Tensor]) -> torch.FloatTensor:
-        logits_1 = self.predict(input_1)
-        logits_2 = self.predict(input_2)
-
-        logits_diff = logits_1 - logits_2
-
-        out = self.out_activation(logits_diff)
-        return out
-
     def _get_matching_matrix(self, query: torch.Tensor, doc: torch.Tensor) -> torch.FloatTensor:
         # shape = [B, L, D]
         embed_query = self.embeddings(query.long())
@@ -123,7 +114,7 @@ class KNRM(torch.nn.Module):
         kernels_out = torch.stack(KM, dim=1)
         return kernels_out
 
-    def predict(self, inputs: Dict[str, torch.Tensor]) -> torch.FloatTensor:
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.FloatTensor:
         query, doc = inputs['query'], inputs['document']
         # shape = [B, L, R]
         matching_matrix = self._get_matching_matrix(query, doc)
@@ -139,9 +130,10 @@ class Solution:
                  freeze_knrm_embeddings: bool = True,
                  knrm_kernel_num: int = 21,
                  knrm_out_mlp: List[int] = [],
-                 index_factory_string='IVF2048_HNSW32,Flat',
+                 # index_factory_string='IVF2048_HNSW32,Flat',
+                 index_factory_string='IDMap,Flat',
                  faiss_vector_max_len=30,
-                 k_ann_num=50,
+                 k_ann_num=100,
                  prediction_num=10
                  ):
         logger.info("Initialize Solution starting...")
@@ -216,7 +208,7 @@ class Solution:
             word_emb = self._preproc_one_document(d)
             if len(word_emb) > 0:
                 word_emb = np.array(word_emb, dtype=np.float32)
-                word_emb = word_emb.mean(axis=0, dtype=np.float32)
+                word_emb = word_emb.max(axis=0)
             else:
                 word_emb = np.zeros(self.emb_dimention, dtype=np.float32)
             idxs.append(int(i))
@@ -233,11 +225,19 @@ class Solution:
         idxs = self._tokenized_text_to_index(tokenized_text)
         return idxs
 
-    def _preproc_data_for_knrm(self, query: str, doc: int) -> Dict[str, torch.LongTensor]:
-        query = torch.LongTensor(self._convert_text_to_token_idxs(query))
-        result = {'query': query.reshape(1, -1),
-                  'document':
-                      torch.LongTensor(self._convert_text_to_token_idxs(self.docs_database[str(doc)])).reshape(1, -1)}
+    def _preproc_data_for_knrm(self, query: str, docs: np.array) -> Dict[str, torch.LongTensor]:
+        query = torch.LongTensor([self._convert_text_to_token_idxs(query)] * len(docs))
+        max_len = -1
+        p_docs = []
+        for i in docs:
+            if i >= 0:
+                d = self._convert_text_to_token_idxs(self.docs_database[str(i)])
+                p_docs.append(d)
+                max_len = max(len(d), max_len)
+        document = [pd + [0] * (max_len - len(pd)) for pd in p_docs]
+        document = torch.LongTensor(document)
+        result = {'query': query,
+                  'document': document}
         return result
 
     def train_faiss_model(self, raw_docs: Dict[str, str]) -> int:
@@ -254,33 +254,33 @@ class Solution:
     def predict(self, queries: List) -> Tuple[List[bool], List[Optional[List[Tuple[str, str]]]]]:
         lang_check = []
         suggestions = []
-        for i in range(len(queries)):
-            lc = False
-            sug = None
-            if detect(queries[i]) == 'en':
-                word_emb = self._preproc_one_document(queries[i])
-                if len(word_emb) > 0:
-                    word_emb = np.array(word_emb, dtype=np.float32)
-                    word_emb = word_emb.mean(axis=0, dtype=np.float32).reshape(1, -1)
-                    _, k_neinborns = self.faiss_index.search(word_emb, self.k_ann_num)
-                    k_neinborns = k_neinborns.squeeze()
-                    logger.debug(k_neinborns)
-                    preds = [self.mlp.predict(self._preproc_data_for_knrm(queries[i], d)).squeeze().item()
-                             for d in k_neinborns if d >= 0]
-                    if len(preds) > 0:
-                        preds = np.array(preds)
-                        logger.debug(f'Query is {queries[i]}')
-                        logger.debug(preds)
-                        argsort = np.argsort(preds)[::-1]
-                        argsort = argsort[:self.prediction_num]
-                        pred_idxs = k_neinborns[argsort]
-                        pred = [(str(i), self.docs_database[str(i)]) for i in pred_idxs]
-                        logger.debug(f'Preds is {pred}')
-                        sug = pred
-                        lc = True
-            lang_check.append(lc)
-            suggestions.append(sug)
-        return lang_check, suggestions
+        with torch.no_grad():
+            self.mlp.eval()
+            for i in range(len(queries)):
+                lc = False
+                sug = None
+                if detect(queries[i]) == 'en':
+                    word_emb = self._preproc_one_document(queries[i])
+                    if len(word_emb) > 0:
+                        word_emb = np.array(word_emb, dtype=np.float32)
+                        word_emb = word_emb.max(axis=0).reshape(1, -1)
+                        _, k_neinborns = self.faiss_index.search(word_emb, self.k_ann_num)
+                        k_neinborns = k_neinborns.squeeze()
+                        inputs = self._preproc_data_for_knrm(queries[i], k_neinborns)
+                        preds = self.mlp(inputs)
+                        if len(preds) > 0:
+                            preds = np.array(preds.squeeze())
+                            logger.debug(f'Query is {queries[i]}')
+                            argsort = np.argsort(preds)[::-1]
+                            argsort = argsort[:self.prediction_num]
+                            pred_idxs = k_neinborns[argsort]
+                            pred = [(str(i), self.docs_database[str(i)]) for i in pred_idxs]
+                            logger.debug(f'Preds is {pred}')
+                            sug = pred
+                            lc = True
+                lang_check.append(lc)
+                suggestions.append(sug)
+            return lang_check, suggestions
 
 
 model = Solution()
@@ -303,7 +303,7 @@ def query():
         queries = json.loads(request.json)['queries']
         lang_check, suggestions = model.predict(queries)
         # return jsonify({'lang_check': lang_check, 'suggestions': suggestions})
-        response = json.dumps({'lang_check': lang_check, 'suggestions': suggestions}).encode('utf-8')
+        response = json.dumps({'lang_check': lang_check, 'suggestions': suggestions})
     return Response(response=response, status=200, mimetype="application/json")
 
 
