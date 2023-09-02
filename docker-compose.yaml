@@ -1,0 +1,15 @@
+version: '3.5'
+services:
+  knrn-questions-nint-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # flask requires SIGINT to stop gracefully
+    # (default stop signal from Compose is SIGTERM)
+    stop_signal: SIGINT
+    ports:
+      - '11000:11000'
+    env_file:
+          - .env
+    restart: on-failure
+    command: python -u solution.py flask run --port 11000
